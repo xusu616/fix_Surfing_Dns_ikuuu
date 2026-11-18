@@ -1,0 +1,6 @@
+id=fix_Surfing_Dns_ikuuu
+name=Fix Surfing DNS (ikuuu)
+version=v1.0.0
+versionCode=100
+author=suxv616
+description=Extract official ikuuu anti-pollution DNS into Surfing config.yaml with precision block backup, instant disable/uninstall restore, CN_IP no-resolve, and AGH compatibility.
