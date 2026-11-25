@@ -4,7 +4,7 @@
 _self_dir=$(dirname "$0" 2>/dev/null || echo ".")
 MODDIR=$(CDPATH= cd -- "$_self_dir" && pwd)
 
-if [ -f "${MODDIR}/common/dns_lib.sh" ]; then
+if [ -f "${MODDIR}/common/dns_lib.sh" ] && [ -f "${MODDIR}/common/agh_fix.sh" ]; then
   . "${MODDIR}/common/dns_lib.sh"
   init_env
   stop_module_inotifyd "$MODDIR"
@@ -17,5 +17,5 @@ else
   if command -v pkill >/dev/null 2>&1; then
     pkill -f "fix_Surfing_Dns_ikuuu/common/inotify.sh" >/dev/null 2>&1 || true
   fi
-  rm -rf "/data/adb/fix_Surfing_Dns_ikuuu"
+  printf '%s\n' "[!] 恢复库缺失，保留 /data/adb/fix_Surfing_Dns_ikuuu 的备份供手动恢复。"
 fi

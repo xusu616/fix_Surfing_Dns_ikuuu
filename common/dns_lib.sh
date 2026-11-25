@@ -1,6 +1,9 @@
 #!/system/bin/sh
 # Shared helper library for fix_Surfing_Dns_ikuuu (Magisk / KernelSU / APatch)
 
+_agh_lib_dir="${MODPATH:-${MODDIR:-.}}"
+. "$_agh_lib_dir/common/agh_fix.sh"
+
 init_env() {
   MOD_ID="fix_Surfing_Dns_ikuuu"
   DATA_DIR="/data/adb/${MOD_ID}"
@@ -109,6 +112,7 @@ init_env() {
   REPLACE_MODE="replace"
   ADD_CN_IP_NORESOLVE="1"
   AUTO_BOOT_SYNC="0"
+  AGH_FIX_ENABLED="1"
   [ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
 
   # Load module state with defaults
@@ -116,7 +120,10 @@ init_env() {
   LAST_APPLIED_DNS=""
   LAST_STATUS="init"
   NO_RESOLVE_APPLIED="0"
+  AGH_APPLIED="0"
+  AGH_STATUS="inactive"
   [ -f "$STATE_FILE" ] && . "$STATE_FILE"
+  init_agh_env
 }
 
 log_msg() {
@@ -179,6 +186,7 @@ DNS_WRITE_MODE="${DNS_WRITE_MODE}"
 REPLACE_MODE="${REPLACE_MODE}"
 ADD_CN_IP_NORESOLVE="${ADD_CN_IP_NORESOLVE}"
 AUTO_BOOT_SYNC="${AUTO_BOOT_SYNC}"
+AGH_FIX_ENABLED="${AGH_FIX_ENABLED}"
 EOF
   chmod 0644 "$SETTINGS_FILE"
 }
@@ -189,6 +197,8 @@ APPLIED="${APPLIED}"
 LAST_APPLIED_DNS="${LAST_APPLIED_DNS}"
 LAST_STATUS="${LAST_STATUS}"
 NO_RESOLVE_APPLIED="${NO_RESOLVE_APPLIED}"
+AGH_APPLIED="${AGH_APPLIED}"
+AGH_STATUS="${AGH_STATUS}"
 EOF
   chmod 0644 "$STATE_FILE"
 }
@@ -977,17 +987,14 @@ probe_dns_live() {
 }
 
 copy_file_preserve_meta() {
-  local _src="$1" _dst="$2" _owner=""
+  local _src="$1" _dst="$2" _owner="0:3005" _mode="644"
   if [ -e "$_dst" ]; then
-    _owner=$(stat -c '%u:%g' "$_dst" 2>/dev/null || true)
+    _owner=$(stat -c '%u:%g' "$_dst" 2>/dev/null) || return 1
+    _mode=$(stat -c '%a' "$_dst" 2>/dev/null) || return 1
   fi
-  cp -f "$_src" "$_dst"
-  chmod 0644 "$_dst"
-  if [ -n "$_owner" ]; then
-    chown "$_owner" "$_dst" 2>/dev/null || true
-  else
-    chown 0:3005 "$_dst" 2>/dev/null || true
-  fi
+  cp -f "$_src" "$_dst" || return 1
+  chmod "$_mode" "$_dst" || return 1
+  chown "$_owner" "$_dst"
 }
 
 parse_controller_info() {
@@ -1044,13 +1051,13 @@ reload_surfing_if_running() {
     if [ -n "$API_PORT" ] && [ "$API_PORT" -gt 0 ] 2>/dev/null; then
       local _http_code=""
       if [ -n "$API_SECRET" ]; then
-        _http_code=$("$CURL" -s -o /dev/null -w "%{http_code}" --max-time 5 -X PUT \
+        _http_code=$("$CURL" --noproxy '*' -s -o /dev/null -w "%{http_code}" --max-time 5 -X PUT \
           "http://${API_HOST}:${API_PORT}/configs?force=true" \
           -H "Authorization: Bearer ${API_SECRET}" \
           -H "Content-Type: application/json" \
           -d "{\"path\":\"${CLASH_CONFIG}\"}" 2>/dev/null)
       else
-        _http_code=$("$CURL" -s -o /dev/null -w "%{http_code}" --max-time 5 -X PUT \
+        _http_code=$("$CURL" --noproxy '*' -s -o /dev/null -w "%{http_code}" --max-time 5 -X PUT \
           "http://${API_HOST}:${API_PORT}/configs?force=true" \
           -H "Content-Type: application/json" \
           -d "{\"path\":\"${CLASH_CONFIG}\"}" 2>/dev/null)
@@ -1064,12 +1071,15 @@ reload_surfing_if_running() {
 
   # Fallback: restart box.service cleanly
   if [ -x "${SURFING_SCRIPTS}/box.service" ]; then
-    "${SURFING_SCRIPTS}/box.service" restart >> "$LOG_FILE" 2>&1
+    "${SURFING_SCRIPTS}/box.service" restart >> "$LOG_FILE" 2>&1 || return 1
     if [ -x "${SURFING_SCRIPTS}/box.iptables" ]; then
-      "${SURFING_SCRIPTS}/box.iptables" renew >> "$LOG_FILE" 2>&1 || true
+      "${SURFING_SCRIPTS}/box.iptables" renew >> "$LOG_FILE" 2>&1 || return 1
     fi
     log_msg "Surfing restarted via box.service"
+    return 0
   fi
+  log_msg "Surfing is running but its configuration could not be reloaded"
+  return 1
 }
 
 cleanup_unapplied_backups() {
@@ -1086,6 +1096,12 @@ apply_dns_fix() {
     acquire_lock || { print_out "[!] 获取操作锁超时"; return 1; }
     _own_lock=1
   fi
+  [ ! -f "$STATE_FILE" ] || . "$STATE_FILE"
+  if module_write_disabled; then
+    log_msg "DNS application cancelled after lock: module disabled/removed"
+    [ "$_own_lock" -eq 0 ] || release_lock
+    return 0
+  fi
 
   local _pid_tag="$$"
   local _tmp_block="${DATA_DIR}/psn_new.${_pid_tag}.tmp"
@@ -1094,6 +1110,7 @@ apply_dns_fix() {
   local _tmp_cfg2="${DATA_DIR}/cfg2.${_pid_tag}.tmp"
   local _pre_edit="${DATA_DIR}/config.yaml.pre_edit.${_pid_tag}"
   local _was_applied="$APPLIED"
+  local _old_dns="$LAST_APPLIED_DNS" _old_noresolve="$NO_RESOLVE_APPLIED"
 
   _cleanup_apply_tmp() {
     rm -f "$_tmp_block" "$_tmp_cur" "$_tmp_cfg1" "$_tmp_cfg2" "$_pre_edit"
@@ -1180,7 +1197,19 @@ apply_dns_fix() {
     return 1
   fi
 
-  copy_file_preserve_meta "$_tmp_cfg2" "$CLASH_CONFIG"
+  if ! copy_file_preserve_meta "$_tmp_cfg2" "$CLASH_CONFIG"; then
+    print_out "[!] 配置写入失败，尝试恢复本次操作前的配置"
+    if copy_file_preserve_meta "$_pre_edit" "$CLASH_CONFIG" &&
+       reload_surfing_if_running; then
+      cleanup_unapplied_backups "$_was_applied"
+      _cleanup_apply_tmp
+    else
+      LAST_STATUS="write_rollback_failed"
+      save_state
+      [ "$_own_lock" -eq 0 ] || release_lock
+    fi
+    return 1
+  fi
 
   # Live DNS resolution check when truly online; auto-rollback if unreachable
   if has_online_network; then
@@ -1188,7 +1217,13 @@ apply_dns_fix() {
       print_out "[+] 实测解析校验通过: ${PROBE_MSG}"
     else
       print_out "[!] 实测解析失败 (${PROBE_MSG})，自动回滚到原有备份！"
-      copy_file_preserve_meta "$_pre_edit" "$CLASH_CONFIG"
+      if ! copy_file_preserve_meta "$_pre_edit" "$CLASH_CONFIG" ||
+         ! reload_surfing_if_running; then
+        LAST_STATUS="rollback_probe_restore_failed"
+        save_state
+        [ "$_own_lock" -eq 0 ] || release_lock
+        return 1
+      fi
       cleanup_unapplied_backups "$_was_applied"
       LAST_STATUS="rollback_probe_failed"
       save_state
@@ -1220,7 +1255,29 @@ apply_dns_fix() {
     done
   fi
 
-  reload_surfing_if_running
+  if ! reload_surfing_if_running || ! sync_agh_fix "$_reason"; then
+    if [ "$AGH_STATUS" = rollback_failed ]; then
+      print_out "[!] AGH 回滚未完成，保留节点 DNS、恢复记录和本次配置快照"
+      [ "$_own_lock" -eq 0 ] || release_lock
+      return 1
+    fi
+    print_out "[!] 重载或 AGH 联动失败，恢复本次操作前的 Surfing 配置"
+    if ! copy_file_preserve_meta "$_pre_edit" "$CLASH_CONFIG" ||
+       ! reload_surfing_if_running; then
+      LAST_STATUS="rollback_reload_failed"
+      save_state
+      [ "$_own_lock" -eq 0 ] || release_lock
+      return 1
+    fi
+    APPLIED="$_was_applied"
+    LAST_APPLIED_DNS="$_old_dns"
+    NO_RESOLVE_APPLIED="$_old_noresolve"
+    LAST_STATUS="rollback_agh_failed"
+    cleanup_unapplied_backups "$_was_applied"
+    save_state
+    _cleanup_apply_tmp
+    return 1
+  fi
   _cleanup_apply_tmp
   return 0
 }
@@ -1232,8 +1289,21 @@ restore_precision_backup() {
     acquire_lock || { log_msg "Failed to acquire lock for restore (${_reason})"; return 1; }
     _own_lock=1
   fi
+  [ ! -f "$STATE_FILE" ] || . "$STATE_FILE"
+
+  # AGH owns a different file; never bypass its restore on a DNS early return.
+  if ! restore_agh_fix "$_reason"; then
+    log_msg "AGH restore incomplete; preserving all recovery records ($_reason)"
+    [ "$_own_lock" -eq 0 ] || release_lock
+    return 1
+  fi
 
   if [ ! -f "$CLASH_CONFIG" ]; then
+    if [ -f "$BACKUP_PSN_META" ] || [ -s "$BACKUP_CN_IP" ]; then
+      log_msg "Surfing config missing; precision backups retained ($_reason)"
+      [ "$_own_lock" -eq 0 ] || release_lock
+      return 1
+    fi
     APPLIED="0"
     LAST_STATUS="no_config_${_reason}"
     save_state
@@ -1258,12 +1328,21 @@ restore_precision_backup() {
 
   if [ "$_had_orig" = "1" ] && [ -s "$BACKUP_PSN" ]; then
     if ! splice_psn_block "$CLASH_CONFIG" "$BACKUP_PSN" "$_tmp_r1"; then
-      cp -f "$CLASH_CONFIG" "$_tmp_r1"
+      log_msg "Cannot restore original DNS block; keeping precision backup ($_reason)"
+      LAST_STATUS="restore_splice_failed"
+      save_state
+      rm -f "$_tmp_r1" "$_tmp_r2"
+      [ "$_own_lock" -eq 0 ] || release_lock
+      return 1
     fi
   elif [ "$_had_orig" = "0" ]; then
     delete_psn_block "$CLASH_CONFIG" "$_tmp_r1"
   else
-    cp -f "$CLASH_CONFIG" "$_tmp_r1"
+    log_msg "Original DNS metadata/block is missing or invalid; backup retained ($_reason)"
+    LAST_STATUS="restore_backup_invalid"
+    save_state
+    [ "$_own_lock" -eq 0 ] || release_lock
+    return 1
   fi
 
   if [ "$NO_RESOLVE_APPLIED" = "1" ] && [ -s "$BACKUP_CN_IP" ]; then
@@ -1273,7 +1352,15 @@ restore_precision_backup() {
   fi
 
   if validate_config_file "$_tmp_r2"; then
-    copy_file_preserve_meta "$_tmp_r2" "$CLASH_CONFIG"
+    if ! copy_file_preserve_meta "$_tmp_r2" "$CLASH_CONFIG" ||
+       ! reload_surfing_if_running; then
+      rm -f "$_tmp_r1" "$_tmp_r2"
+      LAST_STATUS="restore_reload_failed"
+      save_state
+      log_msg "Precision restore write/reload failed; backups retained ($_reason)"
+      [ "$_own_lock" -eq 0 ] || release_lock
+      return 1
+    fi
     rm -f "$_tmp_r1" "$_tmp_r2" "$BACKUP_PSN" "$BACKUP_PSN_META" "$BACKUP_CN_IP"
     APPLIED="0"
     LAST_APPLIED_DNS=""
@@ -1281,7 +1368,6 @@ restore_precision_backup() {
     LAST_STATUS="restored_${_reason}"
     save_state
     log_msg "Precision restore succeeded (${_reason})"
-    reload_surfing_if_running
     [ "$_own_lock" -eq 1 ] && release_lock
     return 0
   else
@@ -1319,7 +1405,7 @@ stop_module_inotifyd() {
   fi
 }
 
-BASE_DESC="Extract official ikuuu anti-pollution DNS into Surfing config.yaml with precision block backup, instant disable/uninstall restore, CN_IP no-resolve, and AGH compatibility."
+BASE_DESC="ikuuu 节点 DNS、可选 AGH DNSPod 代理联动、CN_IP no-resolve；只恢复本模块拥有的改动。"
 
 set_prop_description() {
   local _prop="$1" _desc="$2"
@@ -1336,6 +1422,10 @@ set_prop_description() {
 update_module_desc() {
   # Args: <moddir> <pending_reboot|active|disabled|error>
   local _moddir="$1" _mode="$2" _desc=""
+  if [ "$_mode" = active ] &&
+     { [ -f "${_moddir}/disable" ] || [ -f "${_moddir}/remove" ] || module_write_disabled; }; then
+    _mode=disabled
+  fi
   case "$_mode" in
     pending_reboot)
       if [ -f "${_moddir}/disable" ] || [ -f "${LIVE_MOD_DIR}/disable" ]; then
@@ -1348,13 +1438,18 @@ update_module_desc() {
       ;;
     active)
       if [ "$APPLIED" = "1" ] && [ -n "$LAST_APPLIED_DNS" ]; then
-        _desc="[运行中 | ${LAST_APPLIED_DNS}] ${BASE_DESC}"
+        _desc="[运行中 | ${LAST_APPLIED_DNS} | AGH:${AGH_STATUS}] ${BASE_DESC}"
       else
         _desc="[未应用 | 点击操作检查或修复] ${BASE_DESC}"
       fi
       ;;
     disabled)
-      _desc="[已停用 | 已精准还原原有配置] ${BASE_DESC}"
+      if [ -f "$AGH_GROUP_BACKUP" ] || [ -s "$AGH_RULES_ADDED" ] ||
+         [ -f "$BACKUP_PSN_META" ] || [ -s "$BACKUP_CN_IP" ]; then
+        _desc="[已停用 | 恢复未完成，备份保留] ${BASE_DESC}"
+      else
+        _desc="[已停用 | 模块改动已撤销] ${BASE_DESC}"
+      fi
       ;;
     *)
       _desc="[异常 | 点击操作查看诊断] ${BASE_DESC}"

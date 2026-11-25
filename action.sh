@@ -40,7 +40,7 @@ printf "${CLR_BLD}======================================================${CLR_RS
 printf "${CLR_BLD}     Fix Surfing DNS (ikuuu) 实时诊断与修复自检${CLR_RST}\n"
 printf "${CLR_BLD}======================================================${CLR_RST}\n"
 echo "测试时间: $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
-echo "当前策略: 写入=${DNS_WRITE_MODE} | 模式=${REPLACE_MODE} | CN_IP_no-resolve=${ADD_CN_IP_NORESOLVE} | 开机同步=${AUTO_BOOT_SYNC}"
+echo "当前策略: 写入=${DNS_WRITE_MODE} | 模式=${REPLACE_MODE} | CN_IP_no-resolve=${ADD_CN_IP_NORESOLVE} | 开机同步=${AUTO_BOOT_SYNC} | AGH联动=${AGH_FIX_ENABLED}"
 echo ""
 
 check_cn_ip_missing_noresolve() {
@@ -178,7 +178,7 @@ fi
 # 3. 检查 AdGuardHome 规则拦截与 127.0.0.1 本地端口防冲突状态
 # ------------------------------------------------------------------------------
 echo ""
-printf "${CLR_BLD}[3/5] 检查 AdGuardHome 规则保护与 127.0.0.1 兼容性...${CLR_RST}\n"
+printf "${CLR_BLD}[3/5] 检查 AGH 联动、实际进程与 DNS 响应...${CLR_RST}\n"
 AGH_PROXY_SH="/data/adb/agh/scripts/ProxyConfig.sh"
 AGH_CONF="/data/adb/agh/settings.conf"
 _agh_found=0
@@ -188,7 +188,7 @@ if [ -f "$AGH_PROXY_SH" ]; then
   if grep "ALL_SECTIONS" "$AGH_PROXY_SH" 2>/dev/null | grep -q "proxy-server-nameserver"; then
     fail "检测到旧版 AGH ProxyConfig.sh 包含 proxy-server-nameserver，可能会覆盖机场 DNS！"
   else
-    pass "AGH ProxyConfig.sh 已豁免 proxy-server-nameserver。"
+    info "AGH ProxyConfig.sh 未检测到节点 DNS 覆盖（静态检查）。"
   fi
 fi
 
@@ -198,8 +198,50 @@ if [ -f "$AGH_CONF" ]; then
   _agh_port=$(sed -n 's/^[[:space:]]*redir_port=["'\'']\{0,1\}\([^"'\''[:space:]#]*\).*/\1/p' "$AGH_CONF" 2>/dev/null | head -n 1)
   if [ "$_agh_ipt" = "true" ]; then
     warn "AGH settings.conf 中 enable_iptables=true，可能会与 Clash Fake-IP 抢占 53 端口。"
+  elif [ "$_agh_ipt" = "false" ]; then
+    info "AGH 独立 DNS 劫持已关闭 (port=${_agh_port:-unset})，继续检查实际进程。"
   else
-    pass "twoone3 版 AGH 协同正常 (enable_iptables=${_agh_ipt:-false}, port=${_agh_port:-unset})。"
+    warn "无法识别 AGH enable_iptables 设置，不能据此判断兼容正常。"
+  fi
+
+  if [ ! -f "${MODDIR}/disable" ] && [ ! -f "${MODDIR}/remove" ]; then
+    if ! sync_agh_fix "action"; then
+      fail "AGH 联动修复/恢复未完成 ($AGH_STATUS)，恢复资料已保留。"
+    fi
+  fi
+  info "AGH 联动状态: $AGH_STATUS"
+  _agh_pid=$(agh_pid)
+  if [ -n "$_agh_pid" ]; then
+    _agh_gid=$(agh_pid_gid "$_agh_pid")
+    _agh_uid=$(agh_pid_uid "$_agh_pid")
+    info "AGH 实际进程 PID=$_agh_pid，UID=$_agh_uid，GID=$_agh_gid"
+    if [ "$AGH_FIX_ENABLED" = 1 ] && [ "$_agh_uid" = 0 ] &&
+       [ "$_agh_gid" = 3003 ] && agh_rules_ready "$CLASH_CONFIG"; then
+      pass "inet 身份和两条高优先级 DNSPod 路由配置已满足。"
+    elif [ "$AGH_FIX_ENABLED" = 1 ]; then
+      warn "AGH 联动条件未完全满足，请检查 $AGH_STATUS。"
+    fi
+    case "$_agh_port" in
+      ""|*[!0-9]*) warn "AGH DNS 端口不可识别，未发起本地查询。" ;;
+      *)
+        if ss -lnt 2>/dev/null | grep -q "127.0.0.1:$_agh_port "; then
+          pass "AGH 本地 TCP DNS 端口正在监听。"
+          info "实际 DNS 查询（可能命中缓存；不等同于完整应用加载测试）:"
+          for _agh_domain in api.twitter.com pbs.twimg.com video.twimg.com; do
+            _agh_response=$(run_nslookup_timeout 6 0 "$_agh_domain" "127.0.0.1:$_agh_port")
+            _agh_answer=$(printf '%s\n' "$_agh_response" | parse_nslookup_ipv4 | pick_first_usable_ipv4)
+            if [ -n "$_agh_answer" ]; then
+              pass "$_agh_domain -> $_agh_answer"
+            else
+              warn "$_agh_domain 无有效公网 A 答案，请结合 AGH 查询日志检查超时或过滤。"
+            fi
+          done
+        else
+          fail "AGH 本地 DNS 端口未监听。"
+        fi ;;
+    esac
+  else
+    warn "未找到唯一 AGH 进程，未将设置文件当作运行正常的证据。"
   fi
 fi
 
@@ -220,7 +262,7 @@ if [ -f "$CLASH_CONFIG" ]; then
       END { print found + 0 }
     ' "$CLASH_CONFIG" 2>/dev/null)
     if [ "${_agh_dns_local:-0}" -eq 1 ]; then
-      pass "检测到 DNS 配置中的本地 127.0.0.1 AGH 端口保留完好，本模块未干扰。"
+      info "配置中仍保留本地 DNS 地址；实际监听与响应以上述进程检查为准。"
       _agh_found=1
     fi
   fi

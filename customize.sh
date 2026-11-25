@@ -144,7 +144,7 @@ detect_vol_devices
 
 # 按键选择 1: DNS 写入形式 (IP+兜底 vs 原始域名)
 choose_vol_key \
-  "[选择 1/4] 写入 proxy-server-nameserver 的 DNS 格式:" \
+  "[选择 1/5] 写入 proxy-server-nameserver 的 DNS 格式:" \
   "解析为公网 IP 写入 (推荐，解析失败自动兜底原域名)" \
   "直接写入订阅原始域名 (保留 tcp://域名:端口)" \
   "up" 10
@@ -152,7 +152,7 @@ choose_vol_key \
 
 # 按键选择 2: 原有 proxy-server-nameserver 处理方式
 choose_vol_key \
-  "[选择 2/4] 原有 proxy-server-nameserver 处理方式:" \
+  "[选择 2/5] 原有 proxy-server-nameserver 处理方式:" \
   "完全替换为机场抗污染 DNS (清除原 DoH，兼容忽略 127.0.0.1)" \
   "保留原有 DoH 作为备用，将机场抗污染 DNS 置顶" \
   "up" 10
@@ -160,7 +160,7 @@ choose_vol_key \
 
 # 按键选择 3: 额外优化 1 - CN_IP ,no-resolve (独立按键，不合并)
 choose_vol_key \
-  "[选择 3/4] 额外优化 - CN_IP 分流防泄露:" \
+  "[选择 3/5] 额外优化 - CN_IP 分流防泄露:" \
   "自动为 RULE-SET,CN_IP 补上 ,no-resolve (推荐)" \
   "保持 CN_IP 规则原样不动" \
   "up" 10
@@ -168,16 +168,24 @@ choose_vol_key \
 
 # 按键选择 4: 额外优化 2 - 触发与同步方式 (独立按键，不合并，默认仅刷入+手动)
 choose_vol_key \
-  "[选择 4/4] 额外优化 - 后续同步策略:" \
+  "[选择 4/5] 额外优化 - 后续同步策略:" \
   "仅刷入时修复 + 管理器「操作」按钮手动自检/修复 (推荐)" \
   "开启开机后后台自检同步 (模块/订阅更新后自动重修)" \
   "up" 10
 [ "$CHOICE" = "up" ] && _sel_boot="0" || _sel_boot="1"
 
+choose_vol_key \
+  "[选择 5/5] AGH + Surfing 联动，修复 DNSPod DoH 直连超时:" \
+  "启用（兼容配置下使用 inet + 两条 DNS连接 规则；重启后应用）" \
+  "关闭（不接管 AGH；恢复本模块此前拥有的 AGH 改动）" \
+  "up" 10
+[ "$CHOICE" = "up" ] && _sel_agh="1" || _sel_agh="0"
+
 DNS_WRITE_MODE="$_sel_write"
 REPLACE_MODE="$_sel_replace"
 ADD_CN_IP_NORESOLVE="$_sel_cnip"
 AUTO_BOOT_SYNC="$_sel_boot"
+AGH_FIX_ENABLED="$_sel_agh"
 
 if [ "$_is_upgrade" -eq 1 ] && [ -f "${LIVE_MOD_DIR}/disable" ]; then
   save_settings
@@ -192,14 +200,13 @@ else
 
   if ! apply_dns_fix "install"; then
     ui_print ""
-    ui_print "[!] DNS 修复或校验失败，已自动回滚到原配置！"
+    ui_print "[!] DNS 修复或校验未完成，请查看日志中的回滚结果。"
     ui_print "[!] 详细日志请查看: ${LOG_FILE}"
-    if [ "$_is_upgrade" -eq 0 ] && [ "$APPLIED" != "1" ]; then
-      rm -f "$SETTINGS_FILE" "$STATE_FILE" "$BACKUP_FULL" "$BACKUP_PSN" "$BACKUP_PSN_META" "$BACKUP_CN_IP"
-    fi
+    # APPLIED=0 does not prove a failed write/reload was rolled back.
+    # Only the transaction itself may discard a confirmed-unneeded backup.
     cleanup_vol_listeners
     trap - EXIT INT TERM
-    abort "安装已中止，原配置完好无损。"
+    abort "安装已中止；恢复失败时备份和快照会保留，请勿删除模块数据目录。"
   fi
 
   save_settings
@@ -212,6 +219,7 @@ set_perm "${MODPATH}/service.sh" 0 0 0755
 set_perm "${MODPATH}/action.sh" 0 0 0755
 set_perm "${MODPATH}/uninstall.sh" 0 0 0755
 set_perm "${MODPATH}/common/dns_lib.sh" 0 0 0755
+set_perm "${MODPATH}/common/agh_fix.sh" 0 0 0755
 set_perm "${MODPATH}/common/inotify.sh" 0 0 0755
 
 if [ -d "$LIVE_MOD_DIR" ] && [ -f "${LIVE_MOD_DIR}/common/inotify.sh" ] && [ "$MODPATH" = "$LIVE_MOD_DIR" ]; then
@@ -227,4 +235,5 @@ ui_print "  安装与校验全部通过！"
 ui_print "  - 备份位置: ${BACKUP_DIR}"
 ui_print "  - 关闭/卸载模块将实时精准还原原配置"
 ui_print "  - 可随时在管理器点击「操作」运行 DNS 自检"
+ui_print "  - AGH 联动选项: $AGH_FIX_ENABLED；仅恢复本模块实际拥有的改动"
 ui_print "========================================"
